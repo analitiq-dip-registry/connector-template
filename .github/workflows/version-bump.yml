@@ -33,6 +33,22 @@ jobs:
             echo "type=none" >> "$GITHUB_OUTPUT"
           fi
 
+      # A connector's first release publishes the version the template seeded
+      # (1.0.0) rather than bumping past it — RULE-CTOR-032 says a first release
+      # IS 1.0.0. The label is still required as the "release this" signal, but
+      # on the first release its type does not select any arithmetic.
+      - name: Detect first release
+        id: first
+        if: steps.bump.outputs.type != 'none'
+        env:
+          GH_TOKEN: ${{ secrets.ADMIN_PAT }}
+        run: |
+          if [ -z "$(gh release list --limit 1 --json tagName --jq '.[].tagName')" ]; then
+            echo "first=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "first=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Bump connector version
         if: steps.bump.outputs.type != 'none'
         run: |
@@ -47,15 +63,21 @@ jobs:
             echo "::error file=$CONNECTOR::'.version' is '$CURRENT', expected X.Y.Z" >&2
             exit 1
           fi
-          IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
+          if [ "${{ steps.first.outputs.first }}" = "true" ]; then
+            # First release: ship the seeded version untouched.
+            NEW_VERSION="$CURRENT"
+            echo "first release — publishing seeded version $NEW_VERSION without a bump"
+          else
+            IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
 
-          case "$BUMP_TYPE" in
-            major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
-            minor) MINOR=$((MINOR + 1)); PATCH=0 ;;
-            patch) PATCH=$((PATCH + 1)) ;;
-          esac
+            case "$BUMP_TYPE" in
+              major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
+              minor) MINOR=$((MINOR + 1)); PATCH=0 ;;
+              patch) PATCH=$((PATCH + 1)) ;;
+            esac
 
-          NEW_VERSION="${MAJOR}.${MINOR}.${PATCH}"
+            NEW_VERSION="${MAJOR}.${MINOR}.${PATCH}"
+          fi
           jq --arg v "$NEW_VERSION" '.version = $v' "$CONNECTOR" > tmp.json && mv tmp.json "$CONNECTOR"
           echo "NEW_VERSION=$NEW_VERSION" >> "$GITHUB_ENV"
 
@@ -68,11 +90,15 @@ jobs:
           BUMP_TYPE="${{ steps.bump.outputs.type }}"
 
           # Determine changelog section based on bump type
-          case "$BUMP_TYPE" in
-            major) SECTION="Changed" ;;
-            minor) SECTION="Added" ;;
-            patch) SECTION="Fixed" ;;
-          esac
+          if [ "${{ steps.first.outputs.first }}" = "true" ]; then
+            SECTION="Added"
+          else
+            case "$BUMP_TYPE" in
+              major) SECTION="Changed" ;;
+              minor) SECTION="Added" ;;
+              patch) SECTION="Fixed" ;;
+            esac
+          fi
 
           # Build the new entry
           ENTRY="## [$NEW_VERSION] - $TODAY\n\n### $SECTION\n- $PR_TITLE (#$PR_NUMBER)"
@@ -89,8 +115,17 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add definition/connector.json CHANGELOG.md
-          git commit -m "chore: bump version to $NEW_VERSION (#${{ github.event.pull_request.number }})"
-          git push
+          if git diff --cached --quiet; then
+            echo "nothing to commit (version unchanged and CHANGELOG already current)"
+          else
+            if [ "${{ steps.first.outputs.first }}" = "true" ]; then
+              MSG="chore: release $NEW_VERSION (#${{ github.event.pull_request.number }})"
+            else
+              MSG="chore: bump version to $NEW_VERSION (#${{ github.event.pull_request.number }})"
+            fi
+            git commit -m "$MSG"
+            git push
+          fi
 
       - name: Create GitHub Release
         if: steps.bump.outputs.type != 'none'
